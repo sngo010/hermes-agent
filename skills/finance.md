@@ -323,3 +323,182 @@ $GAPI sheets get $SHEET_ID "[Tab]!A:A"
 # Confirm last row matches what was logged
 ```
 
+---
+
+## Deduplication — Bank Statement Upload
+
+### When to Run
+Triggered when Sophie says:
+- "Upload my bank statement"
+- "Import transactions from CSV"
+- "Reconcile my [bank] statement"
+- Sends a CSV file attachment
+
+### Updated Expenses Tab Structure
+Add three columns to the right of existing columns:
+`... Notes | Dedup_Hash | Source | Status`
+
+- `Dedup_Hash` — 10-char fingerprint for duplicate detection
+- `Source` — `telegram` | `csv_upload` | `email_import` | `receipt_photo`
+- `Manual` entries get source tagged at time of logging
+- `Status` — `confirmed` | `pending` | `flagged_review`
+
+### Deduplication Script
+
+```python
+import hashlib
+import csv
+from datetime import datetime, timedelta
+
+def make_hash(date, amount, description):
+    """Generate dedup fingerprint — tolerates minor amount differences"""
+    desc_clean = str(description).lower().strip()[:15]
+    amt_rounded = round(float(amount))  # round to nearest dollar
+    key = f"{date}|{amt_rounded}|{desc_clean}"
+    return hashlib.md5(key.encode()).hexdigest()[:10]
+
+def is_fuzzy_duplicate(new_tx, existing_rows):
+    """
+    Fuzzy match for near-duplicates:
+    - Date within ±2 days (bank settlement lag)
+    - Amount within ±$2.00 (tips, rounding, FX)
+    Returns matching row or None
+    """
+    new_date = datetime.strptime(new_tx['date'], '%Y-%m-%d')
+    new_amt = float(new_tx['amount'])
+
+    for row in existing_rows:
+        try:
+            row_date = datetime.strptime(row['Date'], '%Y-%m-%d')
+            row_amt = float(row['CAD Amount'])
+            date_diff = abs((new_date - row_date).days)
+            amt_diff = abs(new_amt - row_amt)
+
+            if date_diff <= 2 and amt_diff <= 2.00:
+                return row  # duplicate found
+        except (ValueError, KeyError):
+            continue
+    return None
+
+def process_csv_upload(csv_content, sheet_id, gapi):
+    """Main dedup logic for bank statement CSV"""
+
+    # 1. Load existing expenses from Sheets
+    existing = gapi.sheets_get(sheet_id, "Expenses!A:M")
+    existing_hashes = set(row.get('Dedup_Hash', '') for row in existing)
+
+    results = {
+        'new': [],
+        'duplicates': [],
+        'flagged': []
+    }
+
+    for tx in csv.DictReader(csv_content.splitlines()):
+        # Normalize fields (bank CSVs vary — adapt column names as needed)
+        date = tx.get('Date', tx.get('Transaction Date', ''))
+        amount = tx.get('Amount', tx.get('Debit', '0'))
+        description = tx.get('Description', tx.get('Merchant', ''))
+
+        if not date or not amount:
+            continue
+
+        # Convert negative amounts (some banks use negative for debits)
+        amount = abs(float(amount))
+
+        # Layer 1: Hash match (exact duplicate)
+        tx_hash = make_hash(date, amount, description)
+        if tx_hash in existing_hashes:
+            results['duplicates'].append(tx)
+            continue
+
+        # Layer 2: Fuzzy match (near-duplicate)
+        fuzzy_match = is_fuzzy_duplicate(
+            {'date': date, 'amount': amount},
+            existing
+        )
+
+        if fuzzy_match:
+            # Amount mismatch > $0.50 — flag for review
+            row_amt = float(fuzzy_match['CAD Amount'])
+            if abs(amount - row_amt) > 0.50:
+                results['flagged'].append({
+                    'bank': tx,
+                    'manual': fuzzy_match,
+                    'diff': abs(amount - row_amt)
+                })
+                # Update existing row status to flagged_review
+                gapi.sheets_update(sheet_id, f"Expenses!M{fuzzy_match['_row']}", [['flagged_review']])
+            else:
+                # Minor rounding difference — confirm manual entry
+                results['duplicates'].append(tx)
+                gapi.sheets_update(sheet_id, f"Expenses!M{fuzzy_match['_row']}", [['confirmed']])
+            continue
+
+        # Layer 3: No match — insert as new transaction
+        category = infer_category(description)  # use category mapping
+        new_row = [
+            date, description, category, amount, amount, 'CAD',
+            'Auto', '', date[:7], '',  # Notes empty
+            tx_hash, 'csv_upload', 'pending'
+        ]
+        gapi.sheets_append(sheet_id, "Expenses!A:M", [new_row])
+        results['new'].append(tx)
+
+    return results
+```
+
+### Reply Format After Upload
+
+```
+📎 [Bank] Statement — [Month] [Year]
+
+Processed:   X transactions
+✅ New:       X added
+⚠️  Duplicates: X skipped (matched manual entries)
+✅ Confirmed: X manual entries verified against bank
+🔍 Review:   X flagged (amount mismatch)
+
+[If flagged:]
+Flagged for your review:
+→ [Merchant] [Date]: you logged $X, bank shows $Y (Δ$Z)
+→ [Merchant] [Date]: you logged $X, bank shows $Y (Δ$Z)
+
+Reply "confirm all" to accept bank amounts, or correct individually.
+```
+
+### Handling Flagged Transactions
+
+When Sophie says "confirm all":
+- Accept bank amounts as truth
+- Update CAD Amount in each flagged row to bank amount
+- Update Status to "confirmed"
+- Keep Sophie's original description (more readable than bank codes)
+
+When Sophie corrects individually:
+- "Keep my amount for Tim Hortons" → Status = confirmed, keep manual amount
+- "Use bank amount for Grab" → update to bank amount, Status = confirmed
+
+### Bank CSV Column Mapping
+
+Different banks export different column names. Map on import:
+
+| Bank | Date col | Amount col | Description col |
+|---|---|---|---|
+| RBC | `Transaction Date` | `CAD$` | `Description 1` |
+| TD | `Date` | `Debit` | `Description` |
+| CIBC | `Date` | `Debit` | `Transaction Name` |
+| Scotiabank | `Date` | `Withdrawals` | `Description` |
+| Wealthsimple | `Date` | `Amount` | `Merchant` |
+| VPBank (VN) | `Ngày GD` | `Số tiền` | `Nội dung` |
+| VietcomBank | `Ngày` | `Phát sinh Nợ` | `Diễn giải` |
+
+If column names don't match, ask Sophie: "What bank is this statement from?"
+
+### Pitfalls
+
+- **Negative amounts**: Some banks use negative for debits — always use `abs(amount)`
+- **Date format**: Parse flexibly — `%Y-%m-%d`, `%d/%m/%Y`, `%m/%d/%Y` all appear
+- **VND statements**: Amount will be in thousands — divide by rate from memory for CAD
+- **Credit card credits/refunds**: Skip rows where Amount is negative/credit — these are not expenses
+- **Transfer rows**: Skip rows where Description contains "transfer", "payment", "e-transfer" — not expenses
+- **Never insert income rows into Expenses tab** — if Amount is positive credit, route to Income tab instead
