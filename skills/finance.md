@@ -502,3 +502,375 @@ If column names don't match, ask Sophie: "What bank is this statement from?"
 - **Credit card credits/refunds**: Skip rows where Amount is negative/credit — these are not expenses
 - **Transfer rows**: Skip rows where Description contains "transfer", "payment", "e-transfer" — not expenses
 - **Never insert income rows into Expenses tab** — if Amount is positive credit, route to Income tab instead
+
+---
+
+## Amex CSV Import
+
+### When to Trigger
+Any time Sophie uploads a CSV file or says:
+- "Here is my Amex statement"
+- "Import my credit card CSV"
+- "Categorize my transactions"
+- Sends any file with .csv extension
+
+### Critical: Ignore Amex's Own Categories
+Amex CSV contains a "Category" column that shows values like:
+- "Flexible" / "Other" — Membership Rewards eligibility
+- "Merchandise & Supplies" — Amex's own broad taxonomy
+
+**NEVER use Amex's Category column.** Always re-categorize
+from scratch using merchant name matching below.
+
+### Amex CSV Column Mapping
+
+| Amex Column | Use? | Notes |
+|---|---|---|
+| Date | ✅ Yes | Transaction date |
+| Description | ✅ Yes | Primary source for merchant matching |
+| Amount | ✅ Yes | Amex shows debits as POSITIVE numbers |
+| Extended Details | ✅ Optional | Extra merchant info if Description unclear |
+| Appears On Your Statement As | ✅ Optional | Fallback for merchant matching |
+| Address / City / Country | ✅ Optional | Helps with ambiguous merchants |
+| Category | ❌ IGNORE | Amex internal — not useful |
+| Type | ❌ IGNORE | Amex internal classification |
+| Reference | ❌ IGNORE | Transaction ID only |
+
+### Rows to Skip Entirely
+
+Skip and do NOT log these row types:
+```
+Description contains: "PAYMENT", "THANK YOU", "AUTOPAY"
+→ These are bill payments, not expenses
+
+Amount is negative
+→ These are credits or refunds — log separately to Credits column
+
+Description contains: "ANNUAL FEE"
+→ Log to Utilities & Subscriptions as "Amex Annual Fee"
+```
+
+### Amex-Specific Merchant Mapping
+
+Add these to the standard category mapping:
+
+```
+Merchant Pattern          → Category
+─────────────────────────────────────────────────────
+WHOLEFDS / WHOLE FOODS    → Groceries
+LOBLAWS / LOBLAW          → Groceries
+SUPERSTORE / RCSS         → Groceries
+SAVE-ON-FOODS / SAVEON    → Groceries
+T&T SUPERMARKET           → Groceries
+FRESHCO                   → Groceries
+COSTCO WHSE               → Groceries (default; may be Shopping)
+
+MCDONALD / MCDONALDS      → Dining
+TIM HORTONS / TIMHORTON   → Dining
+STARBUCKS                 → Dining
+EARLS / BROWNS / CACTUS   → Dining
+UBER* EATS / UBEREATS     → Dining
+DOORDASH                  → Dining
+SKIP THE DISHES / SKIP    → Dining
+A&W / SUBWAY / CHIPOTLE   → Dining
+
+AMZN / AMAZON.CA          → Shopping
+AMAZON PRIME              → Utilities & Subscriptions
+APPLE.COM/BILL            → Utilities & Subscriptions
+NETFLIX.COM               → Utilities & Subscriptions
+SPOTIFY                   → Utilities & Subscriptions
+GOOGLE *                  → Utilities & Subscriptions
+TELUS                     → Utilities & Subscriptions
+ROGERS                    → Utilities & Subscriptions
+SHAW / ROGERS CABLE       → Utilities & Subscriptions
+HYDRO / BC HYDRO          → Utilities & Subscriptions
+
+ESSO / CHEVRON / PETRO    → Transport
+UBER* (non-EATS)          → Transport
+LYFT                      → Transport
+TRANSLINK / COMPASS       → Transport
+IMPARK / ORCA / PARK      → Transport
+
+SHOPPERS / LONDON DRUG    → Health
+REXALL / PHARMASAVE       → Health
+LULULEMON / ARITZIA       → Shopping
+SPORT CHEK / MEC          → Shopping
+WINNERS / HOMESENSE       → Shopping
+IKEA / STRUCTUBE          → Shopping
+
+AIRBNB                    → Travel
+EXPEDIA / BOOKING.COM     → Travel
+WESTJET / AIR CANADA      → Travel
+DELTA / UNITED / CATHAY   → Travel
+
+VANCOUVER COLLEGE         → Kids
+CHESS / KUMON / SYLVAN    → Kids
+REGISTRATION / LESSONS    → Kids
+
+AMEX TRAVEL               → Travel
+FOREIGN TRANSACTION FEE   → Misc
+```
+
+### Processing Workflow
+
+```python
+def process_amex_csv(csv_content):
+    results = {
+        'logged': [],
+        'skipped_payments': [],
+        'skipped_credits': [],
+        'unrecognized': [],
+        'duplicates': []
+    }
+
+    for row in parse_csv(csv_content):
+        desc = row['Description'].upper()
+        amount = float(row['Amount'])
+
+        # Step 1: Skip payments and credits
+        if any(x in desc for x in ['PAYMENT', 'THANK YOU', 'AUTOPAY']):
+            results['skipped_payments'].append(row)
+            continue
+
+        if amount < 0:
+            results['skipped_credits'].append(row)
+            continue
+
+        # Step 2: Match category from Description
+        # Use Amex-specific mapping FIRST, then standard mapping
+        category = match_amex_merchant(desc)
+        if not category:
+            category = match_standard_keywords(desc)
+        if not category:
+            category = 'Misc'
+            results['unrecognized'].append(row)
+
+        # Step 3: Dedup check (date ± 2 days, amount ± $2)
+        if is_duplicate(row, existing_expenses):
+            results['duplicates'].append(row)
+            continue
+
+        # Step 4: Log to Expenses tab
+        log_expense(
+            date=row['Date'],
+            description=row['Description'],
+            category=category,
+            amount_cad=amount,
+            source='amex_csv',
+            who='Sophie'  # default; Sophie can correct
+        )
+        results['logged'].append(row)
+
+    return results
+```
+
+### Reply Format After Amex Import
+
+```
+📎 Amex Statement — [Month] [Year]
+
+Processed:    X transactions
+✅ Logged:    X categorized and added
+⏭ Skipped:   X payments/credits (not expenses)
+🔁 Duplicate: X already in Sheets
+❓ Review:    X unrecognized merchants
+
+Top spending:
+🍽 Dining        $X  (X transactions)
+🛒 Groceries     $X  (X transactions)
+🛍 Shopping      $X  (X transactions)
+
+Unrecognized merchants — how should I categorize these?
+→ [MERCHANT NAME] $XX — [date]
+→ [MERCHANT NAME] $XX — [date]
+```
+
+### After Import — Always Ask
+
+After processing, always ask:
+```
+"I've logged X transactions. Here are X merchants I couldn't 
+recognize — can you tell me the category for each?"
+```
+
+List each unrecognized merchant with amount and date.
+Once Sophie confirms, update the row AND add to the
+Amex merchant mapping in memory for future imports.
+
+### Building Merchant Memory
+
+After Sophie categorizes an unrecognized merchant, store it:
+```
+memory.set('amex_merchant_map', {
+  'SQ *LITTLE RAYMOND': 'Kids',
+  'YALETOWN BREW': 'Dining',
+  ...
+})
+```
+
+Check this memory FIRST on every future Amex import —
+Sophie's confirmed mappings take priority over all defaults.
+
+---
+
+## Upcoming Expenses Tab
+
+### Tab Structure
+`Name | Amount CAD | Due Date | Frequency | Category | Who | Remind Days | Notes | Last Reminded | Status`
+
+- `Frequency` — one-time | monthly | quarterly | annual
+- `Who` — Sophie | Hai | Joint
+- `Remind Days` — how many days before due date to start reminding
+- `Last Reminded` — date Finley last sent a reminder (prevents spam)
+- `Status` — upcoming | paid | overdue
+
+### When to Use This Tab
+- "Add upcoming expense: property tax $3,200 due July 1"
+- "Remind me about car insurance renewal in September"
+- "What bills are coming up this month?"
+- "What's our total annual expense obligation?"
+- Cron job runs daily at 9am to check for due reminders
+
+---
+
+### 9. Log an Upcoming Expense
+
+When Sophie says "add upcoming expense" or "remind me about":
+
+```bash
+$GAPI sheets append $SHEET_ID "Upcoming!A:J" \
+  --values "[[$NAME,$AMOUNT,$DUE_DATE,$FREQUENCY,$CATEGORY,$WHO,$REMIND_DAYS,$NOTES,'','upcoming']]"
+```
+
+Reply:
+```
+✅ Added: [Name] $X due [Date]
+📅 I'll remind you [X] days before — first reminder on [Date]
+🔁 Frequency: [one-time/annual/etc]
+```
+
+---
+
+### 10. Daily Reminder Check (Cron)
+
+Runs at 9am daily. Query all rows where Status = "upcoming":
+
+```python
+def check_upcoming_reminders():
+    rows = gapi.sheets_get(SHEET_ID, "Upcoming!A:J")
+    today = date.today()
+
+    for row in rows:
+        if row['Status'] != 'upcoming':
+            continue
+
+        due_date = parse_date(row['Due Date'])
+        days_until = (due_date - today).days
+        remind_days = int(row['Remind Days'])
+        last_reminded = parse_date(row['Last Reminded']) if row['Last Reminded'] else None
+
+        # Already past due
+        if days_until < 0:
+            send_telegram(f"🔴 OVERDUE: {row['Name']} ${row['Amount CAD']} was due {abs(days_until)} days ago")
+            update_status(row, 'overdue')
+            continue
+
+        # Within reminder window and not reminded today
+        if days_until <= remind_days:
+            if not last_reminded or last_reminded < today:
+                send_reminder(row, days_until)
+                update_last_reminded(row, today)
+
+def send_reminder(row, days_until):
+    urgency = "🔴" if days_until <= 3 else "⚠️" if days_until <= 7 else "📅"
+    msg = f"""{urgency} Upcoming expense reminder:
+{row['Name']} — ${row['Amount CAD']} CAD
+Due: {row['Due Date']} ({days_until} days)
+Category: {row['Category']} | {row['Who']}
+{row['Notes'] if row['Notes'] else ''}"""
+    telegram.send(msg)
+```
+
+---
+
+### 11. Upcoming Expenses Query
+
+When Sophie asks "what's coming up?" or "upcoming this month":
+
+```bash
+$GAPI sheets get $SHEET_ID "Upcoming!A:J"
+```
+
+Filter by Status = upcoming, sort by Due Date ascending.
+
+Reply format:
+```
+📅 Upcoming Expenses
+
+This month:
+⚠️  Property tax        $3,200  due Jul 1   (Joint)   — 21 days
+📅  Raymond school fees  $2,400  due Jul 15  (Sophie)  — 35 days
+
+Next 3 months:
+📅  Car insurance        $1,800  due Sep 15  (Joint)
+📅  Costco membership    $130    due Aug 20  (Hai)
+
+Annual total remaining: $X across X payments
+Monthly cash flow impact: Jul $X | Aug $X | Sep $X
+```
+
+---
+
+### 12. Mark as Paid
+
+When Sophie says "paid [name]" or "mark [expense] as done":
+
+```python
+# Find matching row
+# Update Status column to 'paid'
+# If Frequency is annual/monthly/quarterly:
+#   Add new row with next due date automatically
+#   next_due = calculate_next_due(due_date, frequency)
+```
+
+Reply:
+```
+✅ Marked [Name] as paid — $X on [date]
+📅 Next due: [next date] — added to Upcoming tab
+```
+
+---
+
+### 13. Cash Flow Integration
+
+When projecting cash flow, always include Upcoming tab:
+
+```python
+def get_upcoming_for_month(year, month):
+    rows = gapi.sheets_get(SHEET_ID, "Upcoming!A:J")
+    return [r for r in rows
+            if r['Status'] == 'upcoming'
+            and parse_date(r['Due Date']).year == year
+            and parse_date(r['Due Date']).month == month]
+```
+
+Add upcoming expenses to the projected expenses line in cash flow:
+```
+July projection:
+  Regular expenses (avg):   $7,800
+  Upcoming — property tax:  $3,200
+  Upcoming — school fees:   $2,400
+  ─────────────────────────────────
+  Total projected:          $13,400
+  ⚠️ July is a heavy month — $5,600 above average
+```
+
+---
+
+### Upcoming Tab Pitfalls
+
+- **Annual expenses**: when marking paid, auto-create next year's row — don't lose track
+- **Joint expenses**: always tag as Joint so both Sophie and Hai see it
+- **Don't double-count**: if an upcoming expense is also in Expenses (already paid), Status must be 'paid'
+- **Remind Days default**: 30 days for amounts >$500, 7 days for amounts <$500
+- **Never remind more than once per day** — check Last Reminded before sending
