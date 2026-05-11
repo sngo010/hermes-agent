@@ -536,6 +536,39 @@ from scratch using merchant name matching below.
 | Type | ❌ IGNORE | Amex internal classification |
 | Reference | ❌ IGNORE | Transaction ID only |
 
+### Column Translation — Amex CSV to Expenses Tab
+
+Never append Amex columns directly to Sheets.
+Always translate using this map before writing:
+
+```python
+def translate_amex_row(amex_row):
+    date = amex_row.get('Date', '')
+    description = amex_row.get('Description', '').strip()
+    amount = abs(float(amex_row.get('Amount', 0)))
+    notes = amex_row.get('Extended Details', '')
+
+    return {
+        'Date':                date,
+        'Description':         description,
+        'Category':            infer_category(description),
+        'CAD Amount':          round(amount, 2),
+        'Original Amount':     round(amount, 2),
+        'Original Currency':   'CAD',
+        'Who':                 'Sophie',
+        'Trip':                '',
+        'Month':               date[:7],  # YYYY-MM
+        'Notes':               notes,
+        'Dedup_Hash':          make_hash(date, amount, description),
+        'Source':              'amex_csv',
+        'Status':              'pending'
+    }
+```
+
+Write to Sheets in EXACTLY this column order:
+Date, Description, Category, CAD Amount, Original Amount,
+Original Currency, Who, Trip, Month, Notes,
+Dedup_Hash, Source, Status
 ### Rows to Skip Entirely
 
 Skip and do NOT log these row types:
